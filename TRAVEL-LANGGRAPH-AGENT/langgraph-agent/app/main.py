@@ -1,4 +1,4 @@
-from graph import graph
+from .graph import graph
 
 def run_travel_planner(payload: dict):
     config = {"configurable": {"thread_id": payload.get("session_id", "default")}}

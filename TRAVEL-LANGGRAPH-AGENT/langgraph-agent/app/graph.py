@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from nodes import (
+from .nodes import (
     input_processor_node,
     flight_agent,
     hotel_agent,
