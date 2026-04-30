@@ -7,7 +7,7 @@ import json
 from langchain_openai import ChatOpenAI
 
 # =========================================================
-# CLOUDWATCH LOGGING CONFIGURATION
+# LOGGING & CONFIG
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -16,10 +16,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TRAVEL_UI")
 
-# Use the ECS Agent Service URL
 LLM_AGENT_URL = os.environ.get("LLM_AGENT_URL", "http://your-ecs-agent:8000/chat")
 
-# Initialize the "Shield" LLM for intent extraction
 llm = ChatOpenAI(
     model="gpt-4o-mini", 
     temperature=0,
@@ -31,41 +29,33 @@ llm = ChatOpenAI(
 # =========================================================
 
 async def parse_user_request(text: str):
-    """
-    The 'Shield' node: Translates messy English into the structured 
-    JSON your LangGraph Agent expects.
-    """
+    """Extracts entities and identifies missing fields."""
     prompt = f"""
     Extract travel details from the user's request. 
     User Request: "{text}"
     
     Return ONLY a JSON object with:
-    - origin (string)
-    - destination (string)
-    - travel_date_input (string)
-    - total_budget (number)
+    - origin (string or "unknown")
+    - destination (string or "unknown")
+    - travel_date_input (string or "unknown")
+    - total_budget (number or null)
     
-    If any field is missing, use "unknown". 
-    For budget, if missing, default to 1000.
+    Rules:
+    - If a field is missing, set it to "unknown" or null.
+    - Do not guess.
     """
     try:
         response = await llm.ainvoke(prompt)
-        # FIX: Robustly clean markdown formatting from LLM response
         content = response.content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.endswith("```"):
-            content = content[:-3]
-        
+        if content.startswith("```json"): content = content[7:-3]
         return json.loads(content.strip())
     except Exception as e:
-        logger.error(f"Failed to parse intent: {e}")
+        logger.error(f"Shield Parsing Error: {e}")
         return None
 
 async def call_agent(payload: dict):
-    """Helper to communicate with the ECS LangGraph Agent"""
     async with httpx.AsyncClient(timeout=60.0) as client:
-        logger.info(f"Calling Agent | Action: {payload.get('action')} | Thread: {payload.get('thread_id')}")
+        logger.info(f"Calling Agent | Action: {payload.get('action')}")
         response = await client.post(LLM_AGENT_URL, json=payload)
         response.raise_for_status()
         return response.json()
@@ -76,46 +66,40 @@ async def call_agent(payload: dict):
 
 @cl.on_chat_start
 async def start():
-    thread_id = cl.user_session.get("id")
-    cl.user_session.set("thread_id", thread_id)
-    logger.info(f"New session started: {thread_id}")
-    
-    await cl.Message(
-        content="✈️ **Travel Planner Active**\nReady to help you plan! You can tell me your plans in plain English.\n\n*Example: 'I want to go from Bangalore to Dubai on May 15th with a budget of 1500'*"
-    ).send()
+    cl.user_session.set("thread_id", cl.user_session.get("id"))
+    await cl.Message(content="✈️ **Smart Travel Planner**\nWhere are we heading? Please include your **Source, Destination, Date, and Budget**.").send()
 
 @cl.on_message
 async def handle_message(message: cl.Message):
     thread_id = cl.user_session.get("thread_id")
     user_input = message.content.strip()
 
-    # Step 1: Check if input is just a number (Manual budget adjustment)
+    # 1. Budget Adjustment Shortcut
     if user_input.replace('.', '', 1).isdigit():
-        payload = {
-            "thread_id": thread_id,
-            "action": "fix_budget",
-            "data": {"total_budget": float(user_input)}
-        }
+        payload = {"thread_id": thread_id, "action": "fix_budget", "data": {"total_budget": float(user_input)}}
         res_data = await call_agent(payload)
         await process_agent_response(res_data)
         return
 
-    # Step 2: Intent Parsing
+    # 2. Data Validation (The Shield)
     structured_data = await parse_user_request(user_input)
     
-    if not structured_data or structured_data.get("origin") == "unknown":
-        await cl.Message(content="I couldn't quite catch those details. Could you please specify your origin, destination, and travel date?").send()
+    missing = []
+    if structured_data.get("origin") == "unknown": missing.append("Source City")
+    if structured_data.get("destination") == "unknown": missing.append("Destination")
+    if not structured_data.get("total_budget"): missing.append("Total Budget")
+
+    if missing:
+        msg = "I need a few more details to start searching: **" + ", ".join(missing) + "**."
+        await cl.Message(content=msg).send()
         return
 
-    # Step 3: Call the Agent
+    # 3. Validated - Call Agent
     payload = {
         "thread_id": thread_id,
         "action": "start",
         "data": {
-            "origin": structured_data["origin"],
-            "destination": structured_data["destination"],
-            "travel_date_input": structured_data["travel_date_input"],
-            "total_budget": structured_data["total_budget"],
+            **structured_data,
             "messages": []
         }
     }
@@ -124,104 +108,56 @@ async def handle_message(message: cl.Message):
         res_data = await call_agent(payload)
         await process_agent_response(res_data)
     except Exception as e:
-        logger.error(f"Agent Call Failed: {e}")
-        await cl.Message(content="⚠️ Agent service unavailable. Please check your ECS logs.").send()
+        await cl.Message(content=f"⚠️ Agent Error: {e}").send()
 
 async def process_agent_response(res_data):
-    """Analyzes graph state and renders high-quality UI elements"""
-    thread_id = cl.user_session.get("thread_id")
-
-    # 1. Handle Flight Selection via Buttons
+    """UI Rendering Logic"""
+    # 1. Flight Buttons
     if "flight_options" in res_data and not res_data.get("selected_flight_price"):
         actions = [
-            cl.Action(
-                name="select_flight", 
-                value=str(f['price']), 
-                label=f["info"],
-                payload={"price": f['price']} 
-            )
+            cl.Action(name="select_flight", label=f["info"], payload={"price": f['price']})
             for f in res_data["flight_options"]
         ]
-        await cl.Message(
-            content="✈️ **I found several flight options. Which one would you like?**",
-            actions=actions
-        ).send()
+        await cl.Message(content="✈️ **Select a Flight:**", actions=actions).send()
 
-    # 2. Handle Budget Deficit
+    # 2. Hotel Buttons (NO LONGER HARDCODED)
+    elif "hotel_options" in res_data and not res_data.get("selected_hotel_price"):
+        actions = [
+            cl.Action(name="select_hotel", label=f"{h['name']} (${h['price']})", payload={"price": h['price']})
+            for h in res_data["hotel_options"]
+        ]
+        await cl.Message(content="🏨 **Select a Hotel:**", actions=actions).send()
+
+    # 3. Budget Alert
     elif res_data.get("remaining_budget", 0) < 0:
-        logger.warning(f"Thread {thread_id} is over budget.")
-        await cl.Message(
-            content=f"❌ **Budget Alert!**\nYou are over budget by **${abs(res_data['remaining_budget'])}**.\n\nPlease type a new **Total Budget** to continue."
-        ).send()
+        over = abs(res_data['remaining_budget'])
+        await cl.Message(content=f"❌ **Budget Alert!**\nYou are over by **${over:.2f}**. Please enter a new total budget.").send()
 
-    # 3. Handle Final Success & Activity Display
+    # 4. Activities
     elif res_data.get("activities"):
-        # Format the header
-        destination = res_data.get('destination_iata', 'your destination')
-        remaining = res_data.get('remaining_budget', 0)
-        
-        header_content = (
-            f"✅ **Trip Planned Successfully for {destination}!**\n"
-            f"💰 **Budget Remaining:** ${remaining:.2f}\n\n"
-            f"--- \n### 🏛️ Recommended Activities\n"
-        )
-        await cl.Message(content=header_content).send()
+        await cl.Message(content=f"✅ **Itinerary Ready!**\nRemaining Budget: **${res_data.get('remaining_budget', 0):.2f}**").send()
+        # Activity card logic...
+        for act in (res_data["activities"][0] if isinstance(res_data["activities"][0], list) else res_data["activities"])[:5]:
+            img = [cl.Image(url=act['thumbnail'], display="inline")] if act.get('thumbnail') else []
+            await cl.Message(content=f"**{act['title']}**\n{act.get('price', 'Free')}", elements=img).send()
 
-        # Iterate through activities and send them as clean cards
-        # We take the first 5 to keep the chat clean
-        activities = res_data["activities"]
-        if isinstance(activities, list) and len(activities) > 0:
-            # If the activities are nested in another list (as seen in your snippet)
-            if isinstance(activities[0], list):
-                activities = activities[0]
-
-            for act in activities[:5]: 
-                price_info = act.get('price', 'Free')
-                rating = f"⭐ {act.get('rating', 'N/A')} ({act.get('reviews', 0)} reviews)"
-                
-                activity_card = (
-                    f"**{act.get('title')}**\n"
-                    f"{rating} | 💳 {price_info}\n"
-                    f"[View on Google Maps]({act.get('link')})"
-                )
-                
-                # If there's a thumbnail, we can display it
-                image = None
-                if act.get('thumbnail'):
-                    image = cl.Image(url=act.get('thumbnail'), name=act.get('title'), display="inline")
-
-                await cl.Message(
-                    content=activity_card,
-                    elements=[image] if image else []
-                ).send()
+# =========================================================
+# CALLBACKS
+# =========================================================
 
 @cl.action_callback("select_flight")
-async def on_action(action: cl.Action):
-    """Handles the button click for flight selection"""
-    thread_id = cl.user_session.get("thread_id")
-    
-    # FIX: Access the price from the payload dictionary
-    # In the previous step, we set: payload={"price": f['price']}
-    try:
-        price = float(action.payload.get("price", 0))
-    except (TypeError, ValueError):
-        logger.error(f"Could not retrieve price from action payload: {action.payload}")
-        await cl.Message(content="⚠️ Error: Could not process the selected price.").send()
-        return
-    
-    logger.info(f"User selected flight: ${price} for thread {thread_id}")
-    
-    payload = {
-        "thread_id": thread_id,
-        "action": "select_prices",
-        "data": {"selected_flight_price": price, "selected_hotel_price": 500}
-    }
-    
-    await cl.Message(content=f"Selected Flight: **${price}**. Finalizing itinerary...").send()
-    
-    try:
-        res_data = await call_agent(payload)
-        await process_agent_response(res_data)
-    except Exception as e:
-        logger.error(f"Action Callback Failed: {e}")
-        await cl.Message(content="⚠️ Error finalizing selection.").send()
+async def on_flight(action: cl.Action):
+    price = float(action.payload["price"])
+    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "select_prices", "data": {"selected_flight_price": price}}
+    await cl.Message(content=f"✈️ Flight selected: ${price}. Finding hotels...").send()
+    res = await call_agent(payload)
+    await process_agent_response(res)
+
+@cl.action_callback("select_hotel")
+async def on_hotel(action: cl.Action):
+    price = float(action.payload["price"])
+    # We now send ONLY the hotel price to let the agent combine it with the flight in its state
+    payload = {"thread_id": cl.user_session.get("thread_id"), "action": "select_prices", "data": {"selected_hotel_price": price}}
+    await cl.Message(content=f"🏨 Hotel selected: ${price}. Finalizing itinerary...").send()
+    res = await call_agent(payload)
+    await process_agent_response(res)
