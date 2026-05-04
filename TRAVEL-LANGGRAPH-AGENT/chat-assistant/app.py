@@ -154,8 +154,25 @@ async def handle_message(message: cl.Message):
 # =========================================================
 
 async def process_agent_response(res_data):
+# 0. Retrieved Booking View (ADD THIS AT TOP)
+    if res_data.get("is_booked") and res_data.get("booking_reference"):
+        summary = f"""
+    ### 🔍 Booking Details
+
+    🆔 Reference: **{res_data.get("booking_reference")}**
+
+    ✈️ Flight Price: ${res_data.get("selected_flight_price")}
+    🏨 Hotel Price: ${res_data.get("selected_hotel_price")}
+
+    💰 Remaining Budget: ${res_data.get("remaining_budget")}
+
+    📍 Route: {res_data.get("origin")} → {res_data.get("destination")}
+    📅 Travel Date: {res_data.get("travel_date_formatted")}
+    """
+        await cl.Message(content=summary).send()
+        return
     # 1. Flight Selection
-    if res_data.get("flight_options") and not res_data.get("selected_flight_price"):
+    elif res_data.get("flight_options") and not res_data.get("selected_flight_price"):
         actions = [
             cl.Action(name="select_flight", label=f"{f['info']} (${f['price']})", payload={"price": f['price']})
             for f in res_data["flight_options"]
