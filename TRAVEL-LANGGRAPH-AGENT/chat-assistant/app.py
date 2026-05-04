@@ -29,6 +29,16 @@ llm = ChatOpenAI(
 )
 
 # =========================================================
+# DEFAULT STATE (CRITICAL FIX)
+# =========================================================
+DEFAULT_STATE = {
+    "origin": "unknown",
+    "destination": "unknown",
+    "travel_date_formatted": "unknown",
+    "total_budget": None
+}
+
+# =========================================================
 # UTILITY FUNCTIONS
 # =========================================================
 
@@ -42,27 +52,24 @@ async def parse_user_request(text: str):
     Return ONLY a JSON object with:
     - origin (string or "unknown")
     - destination (string or "unknown")
-    - travel_date_formatted (ISO format YYYY-MM-DD EXACTLY as mentioned by user)
-    - If year is missing, return "unknown"
-    - NEVER infer year, month, or day
-    - NEVER use current date
-    - NEVER normalize or convert relative dates like "July 15th"
-    
-    Rules:
-    - If missing, return "unknown"
-    - Do NOT assume today's date
-    IMPORTANT:
-    If user says "July 15th", you must return:
-    "unknown" unless year is explicitly provided.
+    - travel_date_formatted (YYYY-MM-DD ONLY if explicitly given)
+    - total_budget (number or null)
+
+    RULES:
+    - DO NOT assume today's date
+    - DO NOT convert "July 15th" unless year is present
+    - If unclear date → "unknown"
     """
 
     try:
         response = await llm.ainvoke(prompt)
         content = response.content.strip()
+
         if content.startswith("```json"):
             content = content[7:-3]
 
         parsed = json.loads(content)
+
         logger.info(f"🧾 Parsed Data: {parsed}")
         return parsed
 
@@ -76,17 +83,22 @@ async def call_agent(payload: dict):
     AGENT_LOG.info(f"📦 Payload: {json.dumps(payload, indent=2)}")
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(LLM_AGENT_URL, json=payload)
-
-        AGENT_LOG.info(f"⬅️ STATUS CODE: {response.status_code}")
-
         try:
+            response = await client.post(LLM_AGENT_URL, json=payload)
+
+            AGENT_LOG.info(f"⬅️ STATUS CODE: {response.status_code}")
+
             data = response.json()
             AGENT_LOG.info(f"📥 RESPONSE: {json.dumps(data, indent=2)}")
             return data
-        except Exception:
-            AGENT_LOG.error("❌ Failed to parse response JSON")
-            return {}
+
+        except httpx.ConnectTimeout:
+            AGENT_LOG.error("❌ CONNECT TIMEOUT to backend")
+            return {"error": "timeout"}
+
+        except Exception as e:
+            AGENT_LOG.error(f"❌ Agent call failed: {e}")
+            return {"error": str(e)}
 
 
 # =========================================================
@@ -98,11 +110,12 @@ async def start():
     thread_id = cl.user_session.get("id")
     cl.user_session.set("thread_id", thread_id)
     cl.user_session.set("activities_shown", False)
+    cl.user_session.set("travel_data", DEFAULT_STATE.copy())
 
     logger.info(f"🚀 SESSION STARTED | Thread ID: {thread_id}")
 
     await cl.Message(
-        content="✈️ **Smart Travel Planner**\nWhere are we heading? Include Source, Destination, Date, Budget."
+        content="✈️ **Smart Travel Planner**\nProvide Source, Destination, Date, Budget."
     ).send()
 
 
@@ -112,12 +125,19 @@ async def handle_message(message: cl.Message):
 
     logger.info(f"📩 USER INPUT: {user_input}")
 
-    # Retrieve flow
-    if user_input.lower().startswith("/retrieve"):
-        parts = user_input.split(" ")
-        ref_id = parts[1].strip().upper()
+    thread_id = cl.user_session.get("thread_id")
 
-        logger.info(f"🔍 RETRIEVE REQUEST | ID: {ref_id}")
+    # =========================
+    # RETRIEVE FLOW
+    # =========================
+    if user_input.lower().startswith("/retrieve"):
+        parts = user_input.split()
+
+        if len(parts) < 2:
+            await cl.Message(content="⚠️ Usage: /retrieve TRV-ID").send()
+            return
+
+        ref_id = parts[1].upper()
 
         cl.user_session.set("thread_id", ref_id)
 
@@ -129,37 +149,36 @@ async def handle_message(message: cl.Message):
         await process_agent_response(res_data)
         return
 
-    thread_id = cl.user_session.get("thread_id")
-    logger.info(f"🧭 THREAD ID: {thread_id}")
-
-    # Budget shortcut
+    # =========================
+    # BUDGET SHORTCUT
+    # =========================
     if user_input.replace('.', '', 1).isdigit():
         logger.info("💰 Budget update detected")
 
-        payload = {
+        res_data = await call_agent({
             "thread_id": thread_id,
             "action": "fix_budget",
             "data": {"total_budget": float(user_input)}
-        }
+        })
 
-        res_data = await call_agent(payload)
         await process_agent_response(res_data)
         return
 
-    # Parse input
-    current_data = cl.user_session.get("travel_data") or {
-        "origin": "unknown",
-        "destination": "unknown",
-        "travel_date_formatted": "unknown",
-        "total_budget": None
-    }
+    # =========================
+    # SESSION LOAD
+    # =========================
+    current_data = cl.user_session.get("travel_data") or DEFAULT_STATE.copy()
 
     new_details = await parse_user_request(user_input)
 
     if new_details:
+        # FIX: map both possible keys safely
+        if "travel_date_formatted" in new_details:
+            new_details["travel_date_formatted"] = new_details["travel_date_formatted"]
+
         for key in ["origin", "destination", "travel_date_formatted"]:
-            val = new_details.get(key, "unknown")
-            if val != "unknown":
+            val = new_details.get(key)
+            if val and val != "unknown":
                 current_data[key] = val
 
         if new_details.get("total_budget"):
@@ -169,6 +188,9 @@ async def handle_message(message: cl.Message):
 
     logger.info(f"🧾 SESSION DATA: {current_data}")
 
+    # =========================
+    # VALIDATION
+    # =========================
     missing = []
     if current_data["origin"] == "unknown":
         missing.append("Source")
@@ -178,17 +200,19 @@ async def handle_message(message: cl.Message):
         missing.append("Budget")
 
     if missing:
-        logger.info(f"⚠️ Missing fields: {missing}")
         await cl.Message(content=f"Need: {', '.join(missing)}").send()
         return
 
-    logger.info("🚀 STARTING AGENT FLOW")
-
+    # =========================
+    # START AGENT
+    # =========================
     payload = {
         "thread_id": thread_id,
         "action": "start",
         "data": current_data
     }
+
+    logger.info("🚀 STARTING AGENT FLOW")
 
     res_data = await call_agent(payload)
     await process_agent_response(res_data)
@@ -202,10 +226,10 @@ async def process_agent_response(res_data):
 
     UI_LOG.info(f"🎯 UI STATE: {json.dumps(res_data, indent=2)}")
 
-    # Booking view
+    # -------------------------
+    # BOOKING VIEW
+    # -------------------------
     if res_data.get("is_booked") and res_data.get("booking_reference"):
-        logger.info("🎉 BOOKING VIEW")
-
         summary = f"""
 ### 🔍 Booking Details
 🆔 {res_data.get("booking_reference")}
@@ -213,14 +237,15 @@ async def process_agent_response(res_data):
 🏨 {res_data.get("selected_hotel_price")}
 💰 {res_data.get("remaining_budget")}
 📍 {res_data.get("origin")} → {res_data.get("destination")}
-📅 {res_data.get("travel_date_formatted")}
+📅 {res_data.get("travel_date_formatted", "unknown")}
 """
-
         await cl.Message(content=summary).send()
         return
 
+    # -------------------------
+    # FLIGHTS
+    # -------------------------
     if res_data.get("flight_options") and not res_data.get("selected_flight_price"):
-        logger.info("✈️ FLIGHT SELECTION")
         actions = [
             cl.Action(
                 name="select_flight",
@@ -229,10 +254,13 @@ async def process_agent_response(res_data):
             )
             for f in res_data["flight_options"]
         ]
-        await cl.Message(content="Select Flight:", actions=actions).send()
+        await cl.Message(content="✈️ Select Flight:", actions=actions).send()
+        return
 
-    elif res_data.get("hotel_options") and not res_data.get("selected_hotel_price"):
-        logger.info("🏨 HOTEL SELECTION")
+    # -------------------------
+    # HOTELS
+    # -------------------------
+    if res_data.get("hotel_options") and not res_data.get("selected_hotel_price"):
         actions = [
             cl.Action(
                 name="select_hotel",
@@ -241,11 +269,13 @@ async def process_agent_response(res_data):
             )
             for h in res_data["hotel_options"]
         ]
-        await cl.Message(content="Select Hotel:", actions=actions).send()
+        await cl.Message(content="🏨 Select Hotel:", actions=actions).send()
+        return
 
-    elif res_data.get("selected_hotel_price") and not res_data.get("is_booked"):
-        logger.info("🛡️ FINAL CONFIRMATION")
-
+    # -------------------------
+    # FINAL CONFIRM
+    # -------------------------
+    if res_data.get("selected_hotel_price") and not res_data.get("is_booked"):
         remaining = res_data.get("remaining_budget", 0)
 
         summary = f"""
@@ -262,10 +292,11 @@ async def process_agent_response(res_data):
         ]
 
         await cl.Message(content=summary, actions=actions).send()
+        return
 
 
 # =========================================================
-# CALLBACKS (FULL TRACE)
+# CALLBACKS
 # =========================================================
 
 @cl.action_callback("select_flight")
@@ -296,7 +327,7 @@ async def on_hotel(action: cl.Action):
 
 @cl.action_callback("confirm_booking")
 async def on_confirm(action: cl.Action):
-    CALLBACK_LOG.info("✅ Booking confirmation triggered")
+    CALLBACK_LOG.info("✅ Confirm booking triggered")
 
     res = await call_agent({
         "thread_id": cl.user_session.get("thread_id"),
