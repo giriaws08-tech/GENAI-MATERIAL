@@ -231,3 +231,4 @@ async def on_show_spots(action: cl.Action):
     for act in res_data.get("activities", [])[:5]:
         img = [cl.Image(url=act['thumbnail'], display="inline")] if act.get('thumbnail') else []
         await cl.Message(content=f"**{act['title']}**\n{act.get('price', 'Free')}", elements=img).send()
+        
